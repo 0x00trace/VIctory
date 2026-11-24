@@ -94,6 +94,7 @@ pub(crate) enum Cast {
     UiToFp = 5,
     SiToFp = 6,
     FPTrunc = 7,
+    FpExt = 8,
     Bitcast = 11,
 }
 

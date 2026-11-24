@@ -22,6 +22,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+mod double;
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -3740,6 +3742,9 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
+        if let Some(r) = self.valu_f64(inst, name, guard) {
+            return r;
+        }
         if let Some(op) = name.strip_prefix("v_pk_") {
             return self.packed16(inst, op, guard);
         }
@@ -4024,7 +4029,7 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cvt_f32_f64" => {
-                let a = self.double_src(inst)?;
+                let a = self.fsrc64(inst, 0)?;
                 let r = self.s.m.cast(c, Cast::FPTrunc, a, self.s.t.f32);
                 float(self, r)
             }
@@ -4263,63 +4268,6 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
         }
-    }
-
-    /// Decode the source of a double-to-float conversion by its FP64 layout.
-    fn double_src(&mut self, inst: &Inst) -> Result<V, Why> {
-        let Fields::Valu(v) = &inst.fields else {
-            unreachable!()
-        };
-        if v.sdwa.is_some() || v.dpp.is_some() {
-            return Err("64-bit operand modifiers");
-        }
-        let op = *v.src.first().ok_or("a missing operand")?;
-        let (lo, mut hi) = match op {
-            Operand::Vector { reg, .. } => self.read_pair(inst, Reg::V(reg), Reg::V(reg + 1))?,
-            Operand::Scalar { code, .. } if code != NULL => {
-                self.read_pair(inst, Reg::S(code), Reg::S(code + 1))?
-            }
-            Operand::Const(code @ 240..=248) => {
-                let constants = [
-                    0.5,
-                    -0.5,
-                    1.0,
-                    -1.0,
-                    2.0,
-                    -2.0,
-                    4.0,
-                    -4.0,
-                    f64::from_bits(0x3fc4_5f30_6dc9_c882), // AMD's inline 1/(2π)
-                ];
-                let bits = constants[usize::from(code - 240)].to_bits();
-                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
-            }
-            // A floating double literal occupies the high dword.
-            Operand::Literal(bits) => (self.s.m.i32(0), self.s.m.i32(bits)),
-            _ => {
-                let lo = self.operand(inst, &op)?;
-                let hi = if matches!(op, Operand::Const(193..=208)) {
-                    u32::MAX
-                } else {
-                    0
-                };
-                (lo, self.s.m.i32(hi))
-            }
-        };
-        let block = self.cur;
-        if v.abs & 1 != 0 {
-            let mask = self.s.m.i32(0x7fff_ffff);
-            hi = self.s.m.bin(block, Bin::And, hi, mask);
-        }
-        if v.neg & 1 != 0 {
-            let sign = self.s.m.i32(0x8000_0000);
-            hi = self.s.m.bin(block, Bin::Xor, hi, sign);
-        }
-        self.s.flags |= flags::DOUBLES;
-        let ty = self.s.m.double();
-        Ok(self
-            .s
-            .op(block, "makeDouble.f64", Attr::ReadNone, ty, 101, &[lo, hi]))
     }
 
     fn read_pair(&mut self, inst: &Inst, lo: Reg, hi: Reg) -> Result<(V, V), Why> {
@@ -5396,11 +5344,17 @@ impl<'a> Lower<'a> {
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
-            "f32" | "f16" => {
-                let (a, b) = if ty == "f16" {
-                    (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
-                } else {
-                    (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
+            "f32" | "f16" | "f64" => {
+                if ty == "f64" && matches!(op, "f" | "tru") {
+                    // Constant, so no doubles are built (WARP loses the device on a
+                    // double `fcmp false`).
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
+                let (a, b) = match ty {
+                    "f16" => (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?),
+                    "f64" => (self.fsrc64(inst, 0)?, self.fsrc64(inst, 1)?),
+                    _ => (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?),
                 };
                 if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
