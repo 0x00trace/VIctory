@@ -52,8 +52,9 @@ pub fn counts() -> (u64, u64) {
 /// What a translation depends on besides its container: the translator
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
-/// translation settings (the loop limit, which `VICTORY_SHADER_LOOP_LIMIT`
-/// changes at run time).
+/// translation settings (the loop and spin-wait limits, which
+/// `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_SHADER_SPIN_LIMIT` change at run
+/// time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -64,18 +65,26 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
+        let spin = victory_shader::emit::spin_limit();
+        if spin != victory_shader::emit::DEFAULT_SPIN_LIMIT {
+            tracing::warn!(
+                spin,
+                "VICTORY_SHADER_SPIN_LIMIT: spin-wait loops stop at this count"
+            );
+        }
+        key(victory_shader::SOURCE_HASH, ENCODING, limit, spin)
     })
 }
 
 /// This file, whose `encode` and `decode` define the entries.
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
+fn key(translator: &str, encoding: &[u8], limit: u32, spin: u32) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&spin.to_le_bytes());
     *h.finalize().as_bytes()
 }
 
@@ -431,21 +440,23 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit) makes another key, so no entry
+    /// this file's encoding, the limits) makes another key, so no entry
     /// written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
+        let k = key("0123456789abcdef", b"encoding", 1 << 20, 1 << 12);
+        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1 << 12));
+        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, 1 << 12));
+        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, 1 << 12));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, 1 << 12));
+        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, 1 << 11));
         assert_eq!(
             *build(),
             key(
                 victory_shader::SOURCE_HASH,
                 ENCODING,
-                victory_shader::emit::loop_limit()
+                victory_shader::emit::loop_limit(),
+                victory_shader::emit::spin_limit()
             )
         );
         // The encoding part is this file as built.

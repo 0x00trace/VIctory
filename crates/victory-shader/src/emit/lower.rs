@@ -53,6 +53,9 @@ pub(crate) struct Lowered {
     pub view_marks: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Back edges that count against the spin-wait limit.
+    #[cfg(test)]
+    pub spin_loops: usize,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -262,6 +265,12 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    /// Headers of loops that only wait for memory to change: they stop
+    /// at [`super::spin_limit`] instead.
+    spin: HashSet<usize>,
+    /// Back edges given the spin-wait limit.
+    #[cfg(test)]
+    spun: usize,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -650,6 +659,9 @@ impl<'a> Lower<'a> {
             abort: None,
             round16: round16(p),
             mode16: Some(0),
+            spin: HashSet::new(),
+            #[cfg(test)]
+            spun: 0,
         }
     }
 
@@ -1230,7 +1242,8 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`; spin waits less).
+        self.spin = super::spin::spin_loops(p);
         for &b in &order {
             let header = p.blocks[b]
                 .preds
@@ -1325,6 +1338,8 @@ impl<'a> Lower<'a> {
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
+            #[cfg(test)]
+            spin_loops: self.spun,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -9476,7 +9491,16 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = if self.spin.contains(&to) {
+            #[cfg(test)]
+            {
+                self.spun += 1;
+            }
+            super::spin_limit()
+        } else {
+            super::loop_limit()
+        };
+        let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -10077,6 +10101,81 @@ mod tests {
         // host to invalidate its cached view of a buffer.
         assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
         assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    }
+
+    /// A table at s0 holding structured buffers of dwords.
+    fn dword_buffers() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let root = RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let used = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        (vec![root], vec![used])
+    }
+
+    #[test]
+    fn a_spin_wait_on_a_table_buffer_gets_the_spin_limit() {
+        // Each lane rereads its flag in a buffer loaded from the table at
+        // s0 until it is no longer 0, then copies it to LDS.
+        let spin = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xE030_6000,
+            0x8002_0100, // 0x14: buffer_load_dword v1, v0, s[8:11], 0 idxen glc
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFA, // s_cbranch_execnz -> 0x14
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = dword_buffers();
+        let l = lower_with(&spin, layout, used).unwrap();
+        assert_eq!(l.spin_loops, 1);
+    }
+
+    #[test]
+    fn a_loop_that_writes_lds_keeps_the_loop_limit() {
+        // The same loop with the LDS write inside it: it has an effect each
+        // round, so it is no spin wait.
+        let writes = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xE030_6000,
+            0x8002_0100, // 0x14: buffer_load_dword v1, v0, s[8:11], 0 idxen glc
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFF8, // s_cbranch_execnz -> 0x14
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            S_ENDPGM,
+        ];
+        let (layout, used) = dword_buffers();
+        let l = lower_with(&writes, layout, used).unwrap();
+        assert_eq!(l.spin_loops, 0);
     }
 
     #[test]
