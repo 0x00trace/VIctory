@@ -221,8 +221,9 @@ impl Lower<'_> {
                 self.write_f64(inst, r, guard)
             }
             _ => {
-                // v_cvt_i32_f64 and v_cvt_u32_f64: D3D saturates and turns
-                // NaN into 0, as the hardware does.
+                // v_cvt_i32_f64 and v_cvt_u32_f64: D3D saturates, as the
+                // hardware does. NaN is 0 there, which the host is told: on
+                // NVIDIA through vkd3d-proton it comes out as 0x80000000.
                 let a = self.fsrc64(inst, 0)?;
                 let op = if name == "v_cvt_u32_f64" {
                     Cast::FpToUi
@@ -231,6 +232,9 @@ impl Lower<'_> {
                 };
                 self.s.flags |= flags::DOUBLE_EXTENSIONS;
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
+                let nan = self.s.m.cmp(c, super::pred::UNO, a, a);
+                let zero = self.s.m.i32(0);
+                let r = self.s.m.select(c, nan, zero, r);
                 let Fields::Valu(v) = &inst.fields else {
                     unreachable!()
                 };
