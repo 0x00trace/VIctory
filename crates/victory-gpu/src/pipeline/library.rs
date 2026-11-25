@@ -182,14 +182,20 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
 /// names its pipelines (the translation, as the shader cache keys it; the
 /// host descriptions).
 fn tag(blob: &[u8]) -> String {
-    let limit = victory_shader::emit::loop_limit().to_le_bytes();
+    let limits = [victory_shader::emit::loop_limit(), victory_shader::emit::spin_limit()];
+    tag_with(blob, limits)
+}
+
+/// [`tag`] with the translation's loop and spin-wait limits.
+fn tag_with(blob: &[u8], limits: [u32; 2]) -> String {
+    let limits = limits.map(u32::to_le_bytes).concat();
     let translator = victory_shader::SOURCE_HASH.as_bytes();
     let mut h = blake3::Hasher::new();
     for part in [
         blob,
         translator,
         include_bytes!("../shader_cache.rs"),
-        &limit,
+        &limits,
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {
@@ -477,6 +483,19 @@ mod tests {
         assert_eq!(listed(saved.as_bytes(), &tag(b"library")), keys);
         assert!(listed(saved.as_bytes(), &tag(b"library2")).is_empty());
         assert!(listed(b"", &tag(b"library")).is_empty());
+    }
+
+    /// The list holds for one translation: a run with another loop or
+    /// spin-wait limit translates loops differently, so the pipelines listed
+    /// are not the ones it makes.
+    #[test]
+    fn the_prebuilt_list_holds_for_its_limits_only() {
+        let t = tag_with(b"library", [1 << 14, 1 << 12]);
+        assert_eq!(t, tag_with(b"library", [1 << 14, 1 << 12]));
+        assert_ne!(t, tag_with(b"library", [1 << 13, 1 << 12]));
+        assert_ne!(t, tag_with(b"library", [1 << 14, 1 << 11]));
+        let limits = [victory_shader::emit::loop_limit(), victory_shader::emit::spin_limit()];
+        assert_eq!(tag(b"library"), tag_with(b"library", limits));
     }
 
     #[test]
