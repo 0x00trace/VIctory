@@ -152,7 +152,7 @@ impl HostHeap {
             && let Ok(heap) = make(total.max(views))
         {
             (heap, count, DYNAMIC)
-        } else if count.saturating_add(DYNAMIC) > PORTABLE_VIEWS
+        } else if count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS
             && let Ok(heap) = make(PORTABLE_VIEWS)
         {
             // shortcut: descriptors past `PORTABLE_VIEWS - DYNAMIC` are
@@ -1584,5 +1584,8 @@ mod tests {
         };
         assert_eq!(heap.dynamic, DYNAMIC);
         assert!(heap.count + heap.dynamic >= PORTABLE_VIEWS);
+        // A heap that fits with the smaller range keeps every title slot.
+        let count = PORTABLE_VIEWS - MIN_DYNAMIC;
+        assert_eq!(HostHeap::new(false, count).unwrap().count, count);
     }
 }
