@@ -6,6 +6,10 @@
 //! (compiler options) and the zlib-compressed GFX10 code. The bitcode may use
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
+// The host side of this crate is Windows-only, so elsewhere what only it
+// uses is unused. Windows builds check for what is unused everywhere.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables))]
+
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;

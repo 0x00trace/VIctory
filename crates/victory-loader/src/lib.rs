@@ -21,6 +21,10 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+// The host side of this crate is Windows-only, so elsewhere what only it
+// uses is unused. Windows builds check for what is unused everywhere.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 #[cfg(windows)]
 mod crash;
 pub mod prepare;
