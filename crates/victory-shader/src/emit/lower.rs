@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_STRIDES, flags};
+use super::shader::{
+    Shader, VIEW_NORMALIZED, VIEW_SNORM16, VIEW_STRIDE_MASK, VIEW_STRIDES, VIEW_UNORM16, flags,
+};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -2134,7 +2136,10 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.f32_to_f16(f, self.mode16 == Some(3))
+    }
+
+    fn f32_to_f16(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -4341,9 +4346,14 @@ impl<'a> Lower<'a> {
         self.end_guarded(outer, &[]);
     }
 
-    /// The byte stride of the buffer view at heap index `index`, from the
-    /// view-stride table (`t`[`VIEW_STRIDES`]).
+    /// The byte stride at heap index `index`, zero for a texture tag.
     fn stride_at(&mut self, index: V) -> V {
+        let entry = self.view_entry(index);
+        let mask = self.s.m.i32(VIEW_STRIDE_MASK);
+        self.s.m.bin(self.cur, Bin::And, entry, mask)
+    }
+
+    fn view_entry(&mut self, index: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, index, four);
@@ -4785,22 +4795,7 @@ impl<'a> Lower<'a> {
             Source::Phi { .. } => return Err(WHY),
             _ => self.lane_heap_index(src, false)?,
         };
-        let c = self.cur;
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let iu = self.s.m.undef(self.s.t.i32);
-        let mask = self.s.m.i8(1);
-        let r = self.s.op(
-            c,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            &[table, at, iu, mask, four],
-        );
-        let x = self.s.m.extract(c, r, 0);
-        Ok(self.as_int(x))
+        Ok(self.stride_at(index))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -5040,13 +5035,7 @@ impl<'a> Lower<'a> {
         let last = self.s.m.i32(super::HEAP_VIEWS - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
-        let four = self.s.m.i32(4);
-        let at = self.s.m.bin(c, Bin::Mul, index, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        let (iu, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1));
-        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, &[table, at, iu, mask, four]);
-        let x = self.s.m.extract(c, r, 0);
-        let stride = self.as_int(x);
+        let stride = self.stride_at(index);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
@@ -7638,6 +7627,102 @@ impl<'a> Lower<'a> {
             .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
     }
 
+    /// A 16-bit normalized texel has an odd denominator, 65535 or 32767.
+    /// Recover its integer magnitude and round that exact ratio once.
+    fn image_norm16(&mut self, x: V, signed: V) -> V {
+        let c = self.cur;
+        let u = self.s.m.f32(65535.0f32.to_bits());
+        let s = self.s.m.f32(32767.0f32.to_bits());
+        let max = self.s.m.select(c, signed, s, u);
+        let a = self.unary(6, x);
+        let scaled = self.s.m.bin(c, Bin::Mul, a, max);
+        let mag = self.unary(26, scaled);
+        let mag = self.s.m.cast(c, Cast::FpToUi, mag, self.s.t.i32);
+        // The binary expansion repeats the 16 or 15 magnitude bits.
+        // Keep the first 32 fraction bits (all ones represents 1 here).
+        let (u, s, k13) = (self.s.m.i32(65537), self.s.m.i32(131076), self.s.m.i32(13));
+        let rep = self.s.m.select(c, signed, s, u);
+        let fixed = self.s.m.bin(c, Bin::Mul, mag, rep);
+        let more = self.s.m.bin(c, Bin::LShr, mag, k13);
+        let zero = self.s.m.i32(0);
+        let more = self.s.m.select(c, signed, more, zero);
+        let fixed = self.s.m.bin(c, Bin::Add, fixed, more);
+        let leading = self.s.op(
+            c,
+            "unaryBits.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            33,
+            &[fixed],
+        );
+        // Bit 31 represents 2^-1. Shift at most 13 places to the f16
+        // normal threshold (2^-14), leaving subnormals in one binade.
+        // FirstbitHi returns -1 for zero, so the unsigned clamp handles it.
+        let is_subnormal = self.s.m.cmp(c, pred::IUGT, leading, k13);
+        let shift = self.s.m.select(c, is_subnormal, k13, leading);
+        let mantissa = self.s.m.bin(c, Bin::Shl, fixed, shift);
+        // Keep the leading bit, ten fraction bits and the round bit.
+        let k20 = self.s.m.i32(20);
+        let doubled = self.s.m.bin(c, Bin::LShr, mantissa, k20);
+        let one = self.s.m.i32(1);
+        // A nonzero, noninteger ratio cannot equal a binary midpoint.
+        let biased = self.s.m.bin(c, Bin::Add, doubled, one);
+        let rounded = self.s.m.bin(c, Bin::LShr, biased, one);
+        let k10 = self.s.m.i32(10);
+        let exp = self.s.m.bin(c, Bin::Sub, k13, shift);
+        let exp = self.s.m.bin(c, Bin::Shl, exp, k10);
+        let half = self.s.m.bin(c, Bin::Add, exp, rounded);
+        let bits = self.as_int(x);
+        let k16 = self.s.m.i32(16);
+        let sign = self.s.m.bin(c, Bin::LShr, bits, k16);
+        let sign_bit = self.s.m.i32(0x8000);
+        let sign = self.s.m.bin(c, Bin::And, sign, sign_bit);
+        self.s.m.bin(c, Bin::Or, sign, half)
+    }
+
+    fn image_d16(&mut self, h: V, channels: &[V], texel: bool) -> Result<Vec<V>, Why> {
+        let c = self.cur;
+        let index = *self
+            .s
+            .view_index
+            .get(&h)
+            .ok_or("an image without a heap index")?;
+        let entry = self.view_entry(index);
+        let flag = self.s.m.i32(VIEW_NORMALIZED);
+        let normalized = self.s.m.cmp(c, pred::IUGE, entry, flag);
+        let truncate: Vec<_> = channels
+            .iter()
+            .map(|&x| {
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[x])
+            })
+            .collect();
+        let norm = self.begin_guarded(Some(normalized));
+        let nearest: Vec<_> = channels
+            .iter()
+            .map(|&x| self.f32_to_f16(x, false))
+            .collect();
+        let nearest = if texel {
+            // Loads and gathers return texels. A filtered sample can be
+            // between two codes and must keep that interpolation.
+            let wide = self.s.m.i32(VIEW_UNORM16);
+            let wide = self.s.m.cmp(self.cur, pred::IUGE, entry, wide);
+            let signed = self.s.m.i32(VIEW_SNORM16);
+            let signed = self.s.m.cmp(self.cur, pred::EQ, entry, signed);
+            let at = self.begin_guarded(Some(wide));
+            let exact: Vec<_> = channels
+                .iter()
+                .map(|&x| self.image_norm16(x, signed))
+                .zip(nearest)
+                .collect();
+            self.end_guarded(at, &exact)
+        } else {
+            nearest
+        };
+        let pairs: Vec<_> = nearest.into_iter().zip(truncate).collect();
+        Ok(self.end_guarded(norm, &pairs))
+    }
+
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Image {
             data,
@@ -8287,21 +8372,19 @@ impl<'a> Lower<'a> {
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
         };
-        let mut xs = Vec::new();
-        for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
-            xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
-            } else {
-                self.as_int(x)
-            });
-        }
+        let channels: Vec<_> = channels
+            .into_iter()
+            .map(|ch| self.s.m.extract(c, r, ch))
+            .collect();
+        // shortcut: integer image formats would keep 16 integer bits.
+        let mut xs = if *d16 {
+            self.image_d16(h, &channels, op == 66 || op == 73)?
+        } else {
+            channels.into_iter().map(|x| self.as_int(x)).collect()
+        };
         if *d16 {
             // Two channels per VGPR, low half first (an odd last high half 0).
+            let c = self.cur;
             let k16 = self.s.m.i32(16);
             xs = xs
                 .chunks(2)

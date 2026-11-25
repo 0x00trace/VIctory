@@ -13,9 +13,14 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
-/// parameter) of the view-stride table: dword `i` is the byte stride of
-/// the buffer view at view-heap index `i`.
+/// parameter) of the view table: dword `i` has the buffer stride or a
+/// texture rounding tag for view-heap index `i`.
 pub const VIEW_STRIDES: u8 = 255;
+// The upper three bits tag textures. A tagged entry has a zero buffer stride.
+pub(super) const VIEW_NORMALIZED: u32 = 1 << 31;
+pub(super) const VIEW_UNORM16: u32 = VIEW_NORMALIZED | 1 << 30;
+pub(super) const VIEW_SNORM16: u32 = VIEW_UNORM16 | 1 << 29;
+pub(super) const VIEW_STRIDE_MASK: u32 = !VIEW_SNORM16;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
@@ -115,8 +120,8 @@ pub(crate) struct Shader {
     /// handles, once a write through a view is marked.
     pub view_marks: Option<V>,
     pub view_writes: Option<V>,
-    /// The heap index of each handle of an unordered buffer view (writes
-    /// through it are marked by the index's view-mark entry).
+    /// The heap index of each texture handle (for its format tag) and
+    /// unordered buffer handle (for strides and write marks).
     pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
@@ -533,8 +538,10 @@ impl Shader {
             &[index, s, n],
         );
         let h = self.annotate(block, h, props.0, props.1);
-        // Unordered typed, raw and structured buffers (kinds 10-12).
-        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+        let kind = props.0 & 0xFF;
+        if !sampler
+            && ((1..=9).contains(&kind) || props.0 & 0x1000 != 0 && (10..=12).contains(&kind))
+        {
             self.view_index.insert(h, index);
         }
         h

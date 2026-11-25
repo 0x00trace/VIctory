@@ -39,14 +39,14 @@ pub(crate) struct HostHeap {
     /// taken, those given back, and where they end.
     pairs: Mutex<(u32, Vec<u32>)>,
     pairs_end: u32,
-    /// View heaps: the view-stride table translated shaders read
+    /// View heaps: the view table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
-    /// byte stride of the buffer view there, 0 for none. Mapped at the
+    /// byte stride of a buffer view or rounding tag of a texture. Mapped at the
     /// address kept beside it.
-    strides: Option<(ID3D12Resource, usize)>,
+    view_table: Option<(ID3D12Resource, usize)>,
     /// View heaps: the view-mark table translated shaders read
     /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
-    /// stride table has one: the mark bit and phase of the unordered buffer
+    /// view table has one: the mark bit and phase of the unordered buffer
     /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
     /// beside it.
     marks: Option<(ID3D12Resource, usize)>,
@@ -120,7 +120,7 @@ impl HostHeap {
         // Every slot a shader can index (title slots, also past a capped
         // heap, and dynamic ones): shaders read the table as a root view,
         // which has no bounds, at indices clamped below `HEAP_VIEWS`.
-        let strides = (!sampler)
+        let view_table = (!sampler)
             .then(|| host.upload_buffer(u64::from(count.max(victory_shader::emit::HEAP_VIEWS)) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
@@ -200,7 +200,7 @@ impl HostHeap {
                 null if !sampler && null > count + extra && null < total => null - 1,
                 _ => total,
             },
-            strides,
+            view_table,
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -386,12 +386,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark) = make_marked(view, self.cpu(index));
+        let (kept, mark, rounding) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.set_stride(index, Some(view));
+        self.write_view_entry(index, view_stride(view) | rounding);
         self.set_mark(index, mark);
     }
 
@@ -448,7 +448,7 @@ impl HostHeap {
             }
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
+        self.write_view_entry(index, 4);
         self.set_mark(index, None);
     }
 
@@ -460,32 +460,32 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
-        self.set_stride(index, None);
+        self.write_view_entry(index, 0);
         self.set_mark(index, None);
         if index < self.count {
             self.viewed.set(index, None, false);
         }
     }
 
-    /// Enters the byte stride of `view` (0 for none or not a buffer view)
-    /// for slot `index` in the view-stride table.
-    fn set_stride(&self, index: u32, view: Option<&View>) {
-        self.write_stride(index, view.map_or(0, view_stride));
-    }
-
-    fn write_stride(&self, index: u32, stride: u32) {
-        let Some((_, data)) = &self.strides else { return };
+    fn write_view_entry(&self, index: u32, entry: u32) {
+        let Some((_, data)) = &self.view_table else {
+            return;
+        };
         if index >= self.count.max(victory_shader::emit::HEAP_VIEWS) {
             return;
         }
         // SAFETY: a dword of the mapped table, which has one per slot below
         // the larger of the title's count and `HEAP_VIEWS`.
-        unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
+        unsafe {
+            (*data as *mut u32)
+                .add(index as usize)
+                .write_volatile(entry)
+        };
     }
 
-    /// The view-stride table, for root SRV `VIEW_STRIDES`.
-    pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
-        self.strides.as_ref().map(|(buffer, _)| buffer)
+    /// The view table, for root SRV `VIEW_STRIDES`.
+    pub(crate) fn view_table(&self) -> Option<&ID3D12Resource> {
+        self.view_table.as_ref().map(|(buffer, _)| buffer)
     }
 
     /// Enters slot `index`'s view-mark entry: the mark bit and phase of the
@@ -605,8 +605,8 @@ impl HostHeap {
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
         self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
-        self.write_stride(index, 4);
-        self.write_stride(index + 1, 4);
+        self.write_view_entry(index, 4);
+        self.write_view_entry(index + 1, 4);
         // Writes through these are title memory's, marked in its page table.
         self.set_mark(index, None);
         self.set_mark(index + 1, None);
@@ -663,7 +663,6 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
-            self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
@@ -673,11 +672,12 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let (kept, mark) = if later {
-                (None, None)
+            let (kept, mark, rounding) = if later {
+                (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            self.write_view_entry(index, view_stride(&view) | rounding);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -993,22 +993,32 @@ thread_local! {
 /// [`make`], and the view-mark entry of the view if it is an unordered
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
-fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+fn make_marked(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> (Option<Kept>, Option<(u32, u32)>, u32) {
     MARK.with(|m| m.set(None));
-    let kept = make(view, at);
-    (kept, MARK.with(std::cell::Cell::take))
+    let mut format = None;
+    let kept = make(view, at, &mut format);
+    let rounding = format.map_or(0, victory_shader::emit::host::texture_rounding);
+    (kept, MARK.with(std::cell::Cell::take), rounding)
 }
 
-/// Whether the host can make a shader (or unordered access) view of
-/// `texture` in `format` (none: the texture's own). The console allows any
-/// view; the host refuses (and removes the device for) views without the
+/// The format the host can use for a shader (or unordered access) view of
+/// `texture`, adjusting the requested `format` when needed. The console
+/// allows any view; the host refuses views without the
 /// resource's permission, of typed depth, and in a format neither of the
 /// resource's family nor among the formats it was made castable to
 /// (`castable`, `resource::castable`). A view of a typed texture in another
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fit_format(
+    texture: &ID3D12Resource,
+    castable: &[u32],
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> Option<DXGI_FORMAT> {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -1025,7 +1035,7 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
             flags = d.Flags.0,
             "view the host does not allow"
         );
-        return false;
+        return None;
     }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
@@ -1039,24 +1049,26 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return (!typeless).then_some(d.Format);
     }
     let cast = castable.contains(&view);
     if family(view) != family(own) && !cast {
         once!(view, own, "view format of another family");
-        return false;
+        return None;
     }
     if cast && family(view) != family(own) && unordered && !typed_store(view) {
         once!(view, own, "an unordered view in a format the host cannot store");
-        return false;
+        return None;
     }
-    if let Some(format) = format
-        && !typeless
-        && !cast
-    {
-        *format = d.Format;
+    let actual = if !typeless && !cast {
+        d.Format
+    } else {
+        DXGI_FORMAT(view as i32)
+    };
+    if let Some(format) = format {
+        *format = actual;
     }
-    true
+    Some(actual)
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1103,12 +1115,16 @@ fn typed_store(format: u32) -> bool {
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
-    make(view, at).flatten().map(|k| k.0)
+    make(view, at, &mut None).flatten().map(|k| k.0)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+fn make(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    format: &mut Option<DXGI_FORMAT>,
+) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -1142,9 +1158,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return None;
-                }
+                let actual = fit_format(
+                    texture,
+                    &copy.castable,
+                    desc.as_mut().map(|d| &mut d.Format),
+                    false,
+                )?;
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -1153,6 +1172,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                *format = Some(actual);
                 Some(Some((texture.clone(), None)))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -1176,16 +1196,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             // A depth texture's unordered views write its twin.
             // SAFETY: a live resource.
             if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
-                return crate::twin::uav(resource, &copy, desc.as_ref(), at)
-                    .map(|twin| Some((twin, None)));
+                let (twin, view_format) = crate::twin::uav(resource, &copy, desc.as_ref(), at)?;
+                *format = Some(view_format);
+                return Some(Some((twin, None)));
             }
             let mut desc = desc.as_ref().map(uav_desc);
             if desc.is_none() && !default_view(resource) {
                 return None;
             }
-            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
-            }
+            let actual = fit_format(
+                texture,
+                &copy.castable,
+                desc.as_mut().map(|d| &mut d.Format),
+                true,
+            )?;
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -1195,6 +1219,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
+            *format = Some(actual);
             Some(Some((texture.clone(), None)))
         }
         View::Sampler(words) => {
@@ -1216,7 +1241,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make(&view, at, format);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
