@@ -7,8 +7,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(not(windows))]
+use unsupported::{Host, Validator, host};
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -322,6 +327,7 @@ pub fn run(
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
 /// (`prebuild`).
+#[cfg(windows)]
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
@@ -428,6 +434,11 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         crate::prebuild::run(&paths, threads)?;
     }
     Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn warm(_: Vec<PathBuf>, _: Option<usize>, _: bool) -> Result<()> {
+    anyhow::bail!("warming the shader cache requires Windows")
 }
 
 /// Shows on stderr how far `workers` are through `file`'s `jobs` (`next`
@@ -870,5 +881,64 @@ mod tests {
             ),
             "{err}"
         );
+    }
+}
+
+/// `--validate` and `--pipelines` need the host's DXIL validator and D3D12
+/// device, which only Windows has; elsewhere they refuse to start.
+#[cfg(not(windows))]
+mod unsupported {
+    use std::path::{Path, PathBuf};
+
+    use victory_shader::emit::HostShader;
+
+    const WHY: &str = "needs Windows (the host DXIL validator and D3D12)";
+
+    pub struct Validator;
+
+    impl Validator {
+        pub fn default_path() -> Option<PathBuf> {
+            None
+        }
+
+        pub fn load(_: Option<&Path>) -> Result<Self, String> {
+            Err(WHY.into())
+        }
+
+        pub fn validate(&mut self, _: &mut [u8]) -> Result<(), String> {
+            Err(WHY.into())
+        }
+    }
+
+    pub struct Host;
+
+    impl Host {
+        pub fn new(_warp: bool) -> Result<Self, String> {
+            Err(WHY.into())
+        }
+
+        pub fn pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(WHY.into())
+        }
+
+        pub fn mesh_pipeline(&self, _: &HostShader, _: &HostShader) -> Result<(), String> {
+            Err(WHY.into())
+        }
+
+        pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            Err(WHY.into())
+        }
+    }
+
+    pub mod host {
+        use victory_shader::emit::HostShader;
+
+        pub fn stub_ps() -> HostShader {
+            unreachable!("Host::new fails first")
+        }
+
+        pub fn stub_vs(_: &HostShader) -> Result<HostShader, String> {
+            Err(super::WHY.into())
+        }
     }
 }

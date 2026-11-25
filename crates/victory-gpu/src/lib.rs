@@ -16,6 +16,13 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
+// The host side of this crate is Windows-only, so elsewhere what only it
+// uses is unused. Windows builds check for what is unused everywhere.
+#![cfg_attr(
+    not(windows),
+    allow(dead_code, unused_imports, unused_mut, unused_variables)
+)]
+
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]

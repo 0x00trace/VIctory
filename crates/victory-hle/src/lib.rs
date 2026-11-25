@@ -11,6 +11,10 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+// The host side of this crate is Windows-only, so elsewhere what only it
+// uses is unused. Windows builds check for what is unused everywhere.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 mod host;
 pub mod modules;
 mod registry;

@@ -230,6 +230,21 @@ mod tests {
         super::run(&crate::workspace_root(), false).unwrap();
     }
 
+    /// Git skips a hook that is not executable, except on Windows.
+    #[test]
+    fn hooks_are_executable() {
+        let out = std::process::Command::new("git")
+            .args(["ls-files", "--stage", ".githooks"])
+            .current_dir(crate::workspace_root())
+            .output()
+            .unwrap();
+        let listed = String::from_utf8(out.stdout).unwrap();
+        assert!(listed.contains(".githooks/pre-commit"), "{listed}");
+        for hook in listed.lines() {
+            assert!(hook.starts_with("100755 "), "{hook}");
+        }
+    }
+
     #[test]
     fn accepts_source() {
         assert!(check("crates/x/src/lib.rs", b"fn main() {}\n").is_empty());
