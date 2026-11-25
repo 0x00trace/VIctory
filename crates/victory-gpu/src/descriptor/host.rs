@@ -1684,4 +1684,76 @@ mod tests {
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    /// In a capped heap the host's own slots follow the title slots that
+    /// fit, at indices the title has slots of its own for. A view the title
+    /// writes there leaves the view-mark and stride entries of the host's
+    /// slot alone (its writes would mark another view's pages, or none), and
+    /// the null slots shaders are led to mark nothing.
+    #[test]
+    fn a_title_view_past_a_capped_heap_leaves_the_marks_of_the_slot_there() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(3);
+        crate::shadow::register(p, p as u64, 3 * PAGE as u64);
+        let views = 4096;
+        let copy = crate::shadow::find(p as u64, 3 * PAGE as u64);
+        let (Some(copy), Some(heap)) = (copy, HostHeap::sized(false, 10_000, views)) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU
+        };
+        // A raw unordered view of 64 dwords, 8 bytes into title page `page`,
+        // and the title's record of it.
+        let record = |page: usize| {
+            let at = p as u64 + (page * PAGE) as u64 + 8;
+            let mut resource = [0u32; 14];
+            resource[0] = 1;
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&[39, 1, 0, 0, 64, 0, 0, 0, 1, 0]);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            let mut record = Box::new([0u64; 4]);
+            crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &desc, record.as_mut_ptr() as u64);
+            record
+        };
+        let (_, marks) = heap.marks.as_ref().unwrap();
+        let (_, strides) = heap.strides.as_ref().unwrap();
+        // SAFETY: dwords of the mapped tables, which cover these indices.
+        let mark = |i: u32| unsafe {
+            let at = (*marks as *const u32).add(2 * i as usize);
+            (at.read_volatile(), at.add(1).read_volatile())
+        };
+        // SAFETY: as above.
+        let stride = |i: u32| unsafe { (*strides as *const u32).add(i as usize).read_volatile() };
+        let none = victory_shader::emit::VIEW_MARK_NONE;
+        let entry = |page: usize| copy.mark_entry(p as u64 + (page * PAGE) as u64 + 8).expect("tracked memory is marked");
+        let (a, b, c) = (record(0), record(1), record(2));
+        // A title slot that fits, and a table's slot made afresh.
+        assert!(heap.mirror(5, a.as_ptr() as u64, true).is_some());
+        assert_eq!((mark(5), stride(5)), (entry(0), 4));
+        let first = heap.dynamic(2).unwrap();
+        assert_eq!(first, heap.count(), "the index after the last title slot that fits");
+        let fresh = crate::descriptor::view(b.as_ptr() as u64).unwrap();
+        heap.make_at(first, &fresh);
+        assert_eq!((mark(first), stride(first)), (entry(1), 4));
+        // A pair of a host copy: raw views whose writes are not marked here.
+        let pair = heap.pair().unwrap();
+        heap.raw_pair_at(pair, None, 4);
+        let before = [first, first + 1, pair, pair + 1, views - 3, views - 2, views - 1].map(|i| (i, mark(i), stride(i)));
+        // The title's views at all of those indices.
+        for (index, ..) in before {
+            for handle in [a.as_ptr(), c.as_ptr()] {
+                assert_eq!(heap.mirror(index, handle as u64, true), None);
+            }
+        }
+        for (index, m, s) in before {
+            assert_eq!((mark(index), stride(index)), (m, s), "slot {index}");
+        }
+        for index in [first + 1, pair, pair + 1, views - 3, views - 2, views - 1] {
+            assert_eq!(mark(index).0, none, "slot {index} marks nothing");
+        }
+        // Given back and made null, the slot marks nothing.
+        heap.make_null(first);
+        heap.release(first, 2);
+        assert_eq!((mark(first).0, stride(first)), (none, 0));
+        crate::shadow::unregister(p, p as u64);
+    }
 }

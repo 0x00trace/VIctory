@@ -136,6 +136,21 @@ const HALF_STORE_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s0 the heap index of a raw unordered buffer view (a root
+/// constant), s1 the resource heap. Stores 7 to dword 1 of the view.
+const HEAP_STORE_WAVE32: &[u32] = &[
+    0x8F04_8500, // s_lshl_b32 s4, s0, 5
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0203,
+    0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+    0x7E02_0287, // v_mov_b32 v1, 7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_0004,
+    0x8002_0100, // buffer_store_dword v1, off, s[8:11], 0 offset:4
+    0xBF81_0000, // s_endpgm
+];
+
 fn param(root: RootType, user_data: u8) -> RootParam {
     RootParam {
         root,
@@ -167,6 +182,17 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_with(words, layout, used, threads, false)
+}
+
+/// [`build`], with `view_marks` writing marks (`emit`, "Write marks").
+fn build_with(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    view_marks: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -193,7 +219,7 @@ fn build(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        view_marks: false,
+        view_marks,
     })
     .expect("lower");
     let shader = HostShader {
@@ -351,6 +377,110 @@ fn a_heap_buffer_read_where_no_buffer_view_is_reads_zeros() {
         // As other tests translate: for a heap of the default size.
         super::set_view_heap(super::HEAP_VIEWS, super::HEAP_VIEWS);
         assert_eq!(words[0], [0; 32], "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// On a host whose heaps mirror fewer title slots than the title may have
+/// (`set_view_heap`), a write through a heap index at or past them is
+/// dropped and marks nothing (`emit`, "Write marks"): what lies there is the
+/// host's own (slot 3 here, with a view and a mark entry of its own). Writes
+/// through title slots land and mark their page. Translated without the
+/// bound, the write at 3 does land and mark, so the setup would show it.
+#[test]
+fn a_write_past_the_title_slots_of_a_capped_heap_marks_nothing() {
+    const VIEWS: u32 = 16;
+    const TITLE: u32 = 3;
+    let none = super::VIEW_MARK_NONE;
+    let mut views: Vec<View> = (0..4).map(|_| View::RawUav(8)).collect();
+    views.push(View::NullBuffers);
+    // Raw views are at 0 to 3, the null ones at 13 (unordered) and 14.
+    let mut strides = vec![0; VIEWS as usize];
+    for i in [0, 1, 2, 3, 13, 14] {
+        strides[i] = 4;
+    }
+    // Slot 0: dword 1 is the first of the next page. Slot 2 is not marked.
+    let mut marks: Vec<u32> = (0..VIEWS).flat_map(|_| [none, 0]).collect();
+    marks[0..2].copy_from_slice(&[100, 0xFFFC]);
+    marks[2..4].copy_from_slice(&[200, 0]);
+    marks[6..8].copy_from_slice(&[300, 0]);
+    // Title slots bound: heap index, the slot written, the bit marked.
+    let bounded: &[(u32, Option<usize>, Option<usize>)] = &[
+        (0, Some(0), Some(101)),
+        (1, Some(1), Some(200)),
+        (2, Some(2), None),
+        (3, None, None),
+        (12, None, None),
+        (13, None, None),
+        (15, None, None),
+        (16, None, None),
+        (1_000_000, None, None),
+        (0x07FF_FFFF, None, None),
+    ];
+    let unbounded: &[(u32, Option<usize>, Option<usize>)] =
+        &[(0, Some(0), Some(101)), (3, Some(3), Some(300)), (12, None, None), (16, None, None)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    /// Puts the default heap back, also when an assertion fails.
+    struct Default;
+    impl Drop for Default {
+        fn drop(&mut self) {
+            super::set_view_heap(super::HEAP_VIEWS, super::HEAP_VIEWS);
+        }
+    }
+    let _default = Default;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (title, cases) in [(TITLE, bounded), (VIEWS, unbounded)] {
+            super::set_view_heap(VIEWS, title);
+            let shader = build_with(
+                HEAP_STORE_WAVE32,
+                vec![param(RootType::Constants, 0), param(RootType::ResourceHeap, 1)],
+                Vec::new(),
+                1,
+                true,
+            );
+            assert!(shader.view_marks);
+            assert_eq!(shader.root_srvs, [VIEW_STRIDES]);
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            for &(index, slot, bit) in cases {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = if u.root == RootType::Constants { index } else { 0 };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (1, Root::View { srv: true, data: strides.clone() }),
+                                (2, Root::View { srv: true, data: marks.clone() }),
+                                (3, Root::Uav(16)),
+                            ],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let at = format!("{label}: index {index}, {title} title slots");
+                let written: Vec<usize> = (0..4).filter(|&s| out[s][1] == 7).collect();
+                assert_eq!(written, slot.into_iter().collect::<Vec<_>>(), "{at}: slots written");
+                let marked: Vec<usize> =
+                    (0..out[4].len() * 32).filter(|&b| out[4][b / 32] >> (b % 32) & 1 != 0).collect();
+                assert_eq!(marked, bit.into_iter().collect::<Vec<_>>(), "{at}: bits marked");
+            }
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
