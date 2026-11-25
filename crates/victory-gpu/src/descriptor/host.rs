@@ -1851,7 +1851,12 @@ mod tests {
         let stride = |i: u32| unsafe { (*strides as *const u32).add(i as usize).read_volatile() };
         let none = victory_shader::emit::VIEW_MARK_NONE;
         let entry = |page: usize| copy.mark_entry(p as u64 + (page * PAGE) as u64 + 8).expect("tracked memory is marked");
+        let address = |page: usize| Some(p as u64 + (page * PAGE) as u64 + 8);
         let (a, b, c) = (record(0), record(1), record(2));
+        // View addresses cover the dynamic slots, and end there.
+        assert!(heap.view_addresses().is_some());
+        let end = heap.count() + heap.dynamic;
+        assert_eq!((heap.address_at(end - 1), heap.address_at(end)), (Some(0), None));
         // A title slot that fits, and a table's slot made afresh.
         assert!(heap.mirror(5, a.as_ptr() as u64, true).is_some());
         assert_eq!((mark(5), stride(5)), (entry(0), 4));
@@ -1860,6 +1865,7 @@ mod tests {
         let fresh = crate::descriptor::view(b.as_ptr() as u64).unwrap();
         heap.make_at(first, &fresh);
         assert_eq!((mark(first), stride(first)), (entry(1), 4));
+        assert_eq!((heap.address_at(5), heap.address_at(first)), (address(0), address(1)));
         // A pair of a host copy: raw views whose writes are not marked here.
         let pair = heap.pair().unwrap();
         heap.raw_pair_at(pair, None, 4);
@@ -1873,6 +1879,7 @@ mod tests {
         for (index, m, s) in before {
             assert_eq!((mark(index), stride(index)), (m, s), "slot {index}");
         }
+        assert_eq!(heap.address_at(first), address(1), "still the fresh table's view");
         for index in [first + 1, pair, pair + 1, views - 3, views - 2, views - 1] {
             assert_eq!(mark(index).0, none, "slot {index} marks nothing");
         }
@@ -1880,6 +1887,7 @@ mod tests {
         heap.make_null(first);
         heap.release(first, 2);
         assert_eq!((mark(first).0, stride(first)), (none, 0));
+        assert_eq!(heap.address_at(first), Some(0));
         crate::shadow::unregister(p, p as u64);
     }
 }
